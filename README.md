@@ -1,69 +1,139 @@
 # kqueue
 
-A production-grade distributed task queue for the JVM, written in Kotlin. Backed by PostgreSQL. Built for reliability, observability, and operational simplicity.
+**A PostgreSQL-backed distributed task queue for the JVM, built in Kotlin.**
 
-```kotlin
-val client = KqueueClient.connect("jdbc:postgresql://localhost/mydb")
+kqueue is a production-oriented task queue designed for applications that already depend on PostgreSQL and want reliable background job processing without operating another infrastructure service.
 
-client.enqueue("emails") {
-    payload = SendEmailRequest(to = "user@example.com", template = "welcome")
-    maxAttempts = 5
-    executeAt = Instant.now().plus(Duration.ofMinutes(2))
-}
-```
+It provides concurrent workers, scheduled jobs, automatic retries, dead-letter handling, graceful recovery from crashed workers, and first-class Prometheus/Grafana observability.
 
----
+> **Design philosophy:** prefer operational simplicity and correctness when PostgreSQL is already part of the stack.
 
 ## Why kqueue?
 
-Most task queues trade operational simplicity for throughput. kqueue makes the opposite bet: if you're already running Postgres, you don't need another service to operate, monitor, and scale. kqueue gives you:
+Task queues often introduce another stateful service into an application's infrastructure. kqueue takes a different approach: use PostgreSQL as the durable source of truth and build the queue around transactional database primitives.
 
-- **At-least-once delivery** backed by Postgres WAL — jobs survive crashes
-- **Safe concurrent dequeuing** via `SELECT ... FOR UPDATE SKIP LOCKED` — no thundering herd, no advisory locks
-- **Automatic retries** with exponential backoff and jitter
-- **Dead-letter queue** with API-driven retry and drain
-- **Scheduled and delayed jobs** via `executeAt`
-- **First-class observability** — Micrometer metrics, Prometheus endpoint, and a pre-built Grafana dashboard out of the box
+This makes kqueue a good fit for workloads where:
 
-If you need >5,000 jobs/sec sustained throughput, use a Redis-backed queue. If you need correctness, auditability, and one less service to operate, use kqueue.
+* jobs must survive process crashes
+* delivery semantics matter more than extreme throughput
+* queue state should be inspectable with standard SQL
+* the application already operates PostgreSQL
+* adding Redis or another queueing system would add unnecessary operational complexity
 
----
-
-## Quick Start
-
-**Requirements:** JDK 17+, Postgres 13+, Docker (for local dev)
-
-```bash
-git clone https://github.com/yourhandle/kqueue
-cd kqueue
-docker compose up -d          # starts Postgres, Prometheus, Grafana
-./gradlew run                  # starts kqueue server on :8080
-```
-
-Grafana is available at [http://localhost:3000](http://localhost:3000) (admin / admin) with the kqueue dashboard pre-provisioned.
-
----
+kqueue uses PostgreSQL row locking with `FOR UPDATE SKIP LOCKED` for safe concurrent job acquisition, avoiding advisory locks and reducing contention between workers.
 
 ## Features
 
-### Enqueue Jobs
+* **At-least-once delivery** backed by PostgreSQL
+* **Concurrent workers** with configurable worker pools
+* **Scheduled and delayed jobs** through `executeAt`
+* **Automatic retries** with exponential backoff and jitter
+* **Dead-letter queue** for jobs that exhaust their retry attempts
+* **Dead-letter recovery** through the REST API and CLI
+* **Stale-job recovery** through a background reaper
+* **Recurring jobs** through cron-style schedules
+* **Graceful worker shutdown**
+* **Prometheus metrics** through Micrometer
+* **Preconfigured Grafana dashboard**
+* **REST API** for queue inspection and job management
+* **Kotlin client API** for application integration
+* **Integration tests** against real PostgreSQL using Testcontainers
+
+## Architecture
+
+At a high level, kqueue consists of a durable PostgreSQL queue, worker processes, and an HTTP/API layer:
+
+```text
+                    ┌─────────────────┐
+                    │   Application   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │  Kqueue Client  │
+                    └────────┬────────┘
+                             │ enqueue
+                             ▼
+                 ┌───────────────────────┐
+                 │      PostgreSQL       │
+                 │                       │
+                 │  pending → running    │
+                 │      ↓        ↓       │
+                 │ completed   failed    │
+                 │                 ↓     │
+                 │               dead    │
+                 └──────────┬────────────┘
+                            │
+                   SKIP LOCKED dequeue
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+       ┌─────────────┐             ┌─────────────┐
+       │   Worker 1  │             │   Worker N  │
+       └─────────────┘             └─────────────┘
+              │                           │
+              └─────────────┬─────────────┘
+                            ▼
+                    ┌─────────────────┐
+                    │   Application   │
+                    │    handlers     │
+                    └─────────────────┘
+
+             ┌──────────────────────────────┐
+             │ Micrometer → Prometheus      │
+             │              → Grafana        │
+             └──────────────────────────────┘
+```
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the detailed design, dequeue strategy, retry behavior, stale-job recovery, and deliberately excluded features.
+
+## Job lifecycle
+
+Jobs move through a small, explicit state machine:
+
+```text
+PENDING ──► RUNNING ──► COMPLETED
+               │
+               └──────► FAILED
+                           │
+                    retry with backoff
+                           │
+                           ▼
+                         PENDING
+
+FAILED ──► DEAD
+          when maximum attempts are exhausted
+```
+
+If a worker crashes while processing a job, the job can remain in `RUNNING`. A background reaper detects stale jobs and returns them to `PENDING` so they can be processed again.
+
+## Enqueue a job
+
+The Kotlin client provides a small API for creating jobs:
 
 ```kotlin
-// Simple enqueue
 client.enqueue("notifications") {
-    payload = PushNotification(userId = 123, message = "Your order shipped")
-}
-
-// With options
-client.enqueue("reports") {
-    payload = ReportRequest(reportId = "q3-summary")
-    priority = 10                                         // higher runs first
-    maxAttempts = 3                                       // default: 3
-    executeAt = Instant.now().plus(Duration.ofHours(1))  // delayed execution
+    payload = PushNotification(
+        userId = 123,
+        message = "Your order shipped"
+    )
 }
 ```
 
-### Define Workers
+Jobs can specify execution options:
+
+```kotlin
+client.enqueue("reports") {
+    payload = ReportRequest(reportId = "q3-summary")
+    priority = 10
+    maxAttempts = 3
+    executeAt = Instant.now().plus(Duration.ofHours(1))
+}
+```
+
+## Define a worker
+
+Workers process jobs concurrently using Kotlin coroutines:
 
 ```kotlin
 val worker = WorkerPool.builder()
@@ -79,7 +149,9 @@ val worker = WorkerPool.builder()
 worker.start()
 ```
 
-### Scheduled (Recurring) Jobs
+## Scheduled jobs
+
+Recurring jobs can be registered with a cron expression:
 
 ```kotlin
 scheduler.register(
@@ -91,168 +163,169 @@ scheduler.register(
 }
 ```
 
-### Dead-Letter Queue
+## Dead-letter handling
 
-Jobs that exhaust all retry attempts move to `DEAD` status. They can be inspected and retried via the REST API or the admin CLI:
+Jobs that exhaust their retry attempts move to `DEAD`.
+
+They can then be inspected or recovered through the API:
 
 ```bash
-# Inspect dead jobs
+# Inspect queue statistics
 curl http://localhost:8080/queues/emails/stats
 
-# Retry a specific dead job
-curl -X POST http://localhost:8080/queues/emails/jobs/{id}/retry
+# Retry a dead job
+curl -X POST \
+  http://localhost:8080/queues/emails/jobs/{id}/retry
 
-# Drain all dead jobs for a queue
-curl -X DELETE http://localhost:8080/queues/emails/dead
+# Drain the dead-letter queue
+curl -X DELETE \
+  http://localhost:8080/queues/emails/dead
 ```
 
----
-
-## Job Lifecycle
-
-```
-PENDING ──► RUNNING ──► COMPLETED
-                │
-                └──► FAILED (retried with backoff)
-                         │
-                         └──► DEAD (max attempts exceeded)
-```
-
-Stale `RUNNING` jobs (worker crashed mid-execution) are automatically detected and reset to `PENDING` by a background reaper.
-
----
+This makes failures observable rather than silently disappearing into worker logs.
 
 ## Observability
 
-kqueue exposes a Prometheus scrape endpoint at `/metrics` and ships a pre-built Grafana dashboard.
+kqueue exposes application and queue metrics through Prometheus.
 
-| Metric | Description |
-|---|---|
-| `kqueue_jobs_enqueued_total` | Jobs enqueued, by queue |
-| `kqueue_jobs_completed_total` | Jobs completed successfully |
-| `kqueue_jobs_failed_total` | Jobs failed (will retry) |
-| `kqueue_jobs_dead_total` | Jobs exhausted all retries |
-| `kqueue_queue_depth` | Current pending jobs per queue |
-| `kqueue_job_duration_seconds` | Execution time histogram |
-| `kqueue_job_wait_seconds` | Time from enqueue to pickup |
+| Metric                        | Description                       |
+| ----------------------------- | --------------------------------- |
+| `kqueue_jobs_enqueued_total`  | Jobs enqueued by queue            |
+| `kqueue_jobs_completed_total` | Successfully completed jobs       |
+| `kqueue_jobs_failed_total`    | Failed jobs that will be retried  |
+| `kqueue_jobs_dead_total`      | Jobs that exhausted their retries |
+| `kqueue_queue_depth`          | Current pending jobs per queue    |
+| `kqueue_job_duration_seconds` | Job execution-time histogram      |
+| `kqueue_job_wait_seconds`     | Time between enqueue and pickup   |
 
-![Grafana dashboard screenshot](docs/grafana-dashboard.png)
+A preconfigured Grafana dashboard is included for local development.
 
----
+## Quick start
 
-## Configuration
+### Requirements
 
-```yaml
-kqueue:
-  datasource:
-    url: jdbc:postgresql://localhost/mydb
-    username: kqueue
-    password: secret
+* JDK 17+
+* PostgreSQL 13+
+* Docker
 
-  worker:
-    shutdownTimeoutSeconds: 30
-    pollingIntervalMs: 500
+### Start the development environment
 
-  reaper:
-    intervalSeconds: 60
-    jobTimeoutSeconds: 300   # jobs running longer than this are considered stuck
+```bash
+git clone https://github.com/sydney-o-connor/kqueue.git
+cd kqueue
 
-  retry:
-    baseDelaySeconds: 5
-    maxJitterSeconds: 5
+docker compose up -d
+./gradlew run
 ```
 
----
+The server starts on port `8080`.
 
-## REST API
+The Docker Compose environment also provides Prometheus and Grafana.
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/queues/{queue}/jobs` | Enqueue a job |
-| `GET` | `/queues/{queue}/jobs/{id}` | Get job status |
-| `GET` | `/queues/{queue}/stats` | Queue depth and throughput |
-| `POST` | `/queues/{queue}/jobs/{id}/retry` | Retry a dead job |
-| `DELETE` | `/queues/{queue}/dead` | Drain dead-letter queue |
-| `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/health` | Health check |
+## Testing
 
-Full API reference: [docs/api.md](docs/api.md)
+Unit tests:
 
----
+```bash
+./gradlew test
+```
 
-## Stack
+Integration tests:
 
-- **Kotlin** + Coroutines
-- **Ktor** — HTTP server
-- **jOOQ** — type-safe SQL (no magic ORM)
-- **HikariCP** — connection pooling
-- **Micrometer** + Prometheus — metrics
-- **Grafana** — dashboards (pre-provisioned via Docker Compose)
-- **Postgres 13+** — storage and queue engine
-- **Testcontainers** — integration tests against real Postgres
+```bash
+./gradlew integrationTest
+```
 
----
+Run the complete suite:
+
+```bash
+./gradlew test integrationTest
+```
+
+Integration tests use Testcontainers to exercise the queue against a real PostgreSQL instance.
 
 ## Performance
 
-Benchmarked on a single worker node (4 vCPU, 8GB RAM) against a local Postgres instance:
+A local benchmark on a single worker node produced the following results with no-op job handlers:
 
-| Concurrency | Throughput | p50 latency | p99 latency |
-|---|---|---|---|
-| 10 workers | ~1,200 jobs/sec | 6ms | 18ms |
-| 50 workers | ~3,800 jobs/sec | 9ms | 34ms |
-| 100 workers | ~5,100 jobs/sec | 14ms | 61ms |
+| Concurrency |      Throughput | p50 latency | p99 latency |
+| ----------: | --------------: | ----------: | ----------: |
+|  10 workers | ~1,200 jobs/sec |        6 ms |       18 ms |
+|  50 workers | ~3,800 jobs/sec |        9 ms |       34 ms |
+| 100 workers | ~5,100 jobs/sec |       14 ms |       61 ms |
 
-Jobs had no-op handlers. Real throughput depends on handler execution time and Postgres I/O.
+These numbers are workload- and hardware-dependent. Real throughput will depend heavily on handler execution time and PostgreSQL I/O.
 
----
+kqueue is intentionally not positioned as a replacement for high-throughput Redis-backed queues. Its design prioritizes durability, inspectability, and reducing infrastructure complexity.
 
-## Architecture
+## REST API
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a full explanation of design decisions, the dequeue strategy, retry logic, the stale job reaper, and what was deliberately left out.
+| Method   | Endpoint                          | Purpose                  |
+| -------- | --------------------------------- | ------------------------ |
+| `POST`   | `/queues/{queue}/jobs`            | Enqueue a job            |
+| `GET`    | `/queues/{queue}/jobs/{id}`       | Get job status           |
+| `GET`    | `/queues/{queue}/stats`           | Inspect queue statistics |
+| `POST`   | `/queues/{queue}/jobs/{id}/retry` | Retry a dead job         |
+| `DELETE` | `/queues/{queue}/dead`            | Drain dead-letter jobs   |
+| `GET`    | `/metrics`                        | Prometheus metrics       |
+| `GET`    | `/health`                         | Health check             |
 
----
+See [`docs/api.md`](docs/api.md) for the API reference.
 
-## Running Tests
+## Technology
 
-```bash
-./gradlew test                  # unit tests
-./gradlew integrationTest       # integration tests (requires Docker for Testcontainers)
-./gradlew test integrationTest  # full suite
-```
+* **Kotlin + Coroutines** — application and worker concurrency
+* **Ktor** — HTTP server
+* **jOOQ** — type-safe SQL
+* **HikariCP** — database connection pooling
+* **PostgreSQL** — durable queue storage
+* **Micrometer + Prometheus** — metrics
+* **Grafana** — visualization
+* **Testcontainers** — PostgreSQL integration testing
+* **Docker Compose** — local infrastructure
 
----
+## Project structure
 
-## Project Structure
-
-```
+```text
 kqueue/
-├── core/               # queue engine, dequeue logic, retry, reaper
-├── worker/             # WorkerPool, coroutine execution, graceful shutdown
+├── core/               # queue engine, dequeue logic, retries, reaper
+├── worker/             # WorkerPool and coroutine execution
 ├── scheduler/          # recurring job definitions
 ├── api/                # Ktor REST API
-├── client/             # SDK for enqueuing jobs from other services
+├── client/             # client SDK
 ├── metrics/            # Micrometer integration
 ├── deploy/
 │   ├── docker-compose.yml
-│   ├── grafana/        # pre-provisioned dashboard
-│   └── prometheus/     # scrape config
+│   ├── grafana/
+│   └── prometheus/
 └── docs/
     ├── api.md
     └── runbook.md
 ```
 
----
+## Design trade-offs
+
+kqueue deliberately keeps its architecture small.
+
+The PostgreSQL-backed approach provides:
+
+* one less stateful service to operate
+* durable queue state
+* straightforward inspection and debugging
+* transactional database semantics
+* familiar operational tooling
+
+The trade-off is that PostgreSQL becomes part of the queue's throughput ceiling. For workloads requiring extremely high sustained throughput, a purpose-built in-memory/distributed queue may be a better fit.
 
 ## Roadmap
 
-- [ ] Idempotency keys / deduplication
-- [ ] Batch enqueue API
-- [ ] Per-queue rate limiting
-- [ ] Web UI for job inspection and dead-letter management
-- [ ] Pluggable backend interface (MySQL, CockroachDB)
+Potential future work includes:
 
----
+* Idempotency keys and deduplication
+* Batch enqueue APIs
+* Per-queue rate limiting
+* Web UI for job inspection and dead-letter management
+* Pluggable storage backends
 
 ## License
 
